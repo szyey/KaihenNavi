@@ -14,6 +14,9 @@ mkdir -p "$out"
 
 mapfile -t files < <(find "$src" -name '*.cs' | sort)
 
+python3 -B "$here/test_ma_guards.py"
+python3 "$here/check_ma_guards.py"
+
 build() {
   local label="$1"; shift
   echo "== $label"
@@ -23,6 +26,8 @@ build() {
       "$here/stubs/UnityStubs.cs" "$here/stubs/VrcAndMaStubs.cs" "${files[@]}"
 }
 
+# NoMA は C# の条件分岐だけを検査する。Unity の asmdef 解決は対象外。
+echo "NoMA checks only the C# branch; Unity assembly resolution requires Unity."
 build NoMA
 build WithMA -define:KAIHENNAVI_MA
 build Full -define:KAIHENNAVI_MA -define:KAIHENNAVI_FULL
