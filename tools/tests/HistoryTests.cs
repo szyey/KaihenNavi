@@ -9,6 +9,7 @@ using UnityEditor;
 using UnityEngine;
 using UnityEngine.UIElements;
 using VRC.SDK3.Avatars.Components;
+using nadena.dev.modular_avatar.core;
 using Object = UnityEngine.Object;
 
 /// <summary>Undo 本体は模倣せず、履歴の分類・保存・復元時の記録対象と、部位選択の副作用を確認する。</summary>
@@ -118,6 +119,168 @@ internal static class HistoryTests
         }
     }
 
+    private static GameObject Child(GameObject parent, string name)
+    {
+        var child = new GameObject(name);
+        child.transform.SetParent(parent.transform, false);
+        return child;
+    }
+
+    /// <summary>JSON の入出力だけ差し替え、既存コンポーネントの永続復元データと適用を確認する。</summary>
+    private static void ParticipantRestoreChecks()
+    {
+        var serialize = JsonUtility.SerializeForTests;
+        var deserialize = JsonUtility.DeserializeForTests;
+        var guidFor = AssetDatabase.GuidForTests;
+        var pathFromGuid = AssetDatabase.PathFromGuidForTests;
+        var loadAll = AssetDatabase.LoadAllForTests;
+        var localId = AssetDatabase.LocalIdForTests;
+        try
+        {
+            var snapshots = new Dictionary<string, object>();
+            JsonUtility.SerializeForTests = value =>
+            {
+                var key = "snapshot-" + snapshots.Count;
+                snapshots.Add(key, value);
+                return key;
+            };
+            JsonUtility.DeserializeForTests = (json, type) => snapshots.ContainsKey(json) ? snapshots[json] : null;
+            var go = new GameObject("RestoreAvatar");
+            var avatar = go.AddComponent<VRCAvatarDescriptor>();
+            var outfit = Child(go, "Outfit");
+            var data = new MenuData();
+            data.items.Add(new MenuItemData { label = "Outfit", parameter = "OutfitParameter",
+                targetPath = HierarchyPath.Get(go.transform, outfit.transform), isDefault = true,
+                hasOriginalActive = true, originalActive = true });
+            var menuRoot = ToggleFeature.BuildMenu(avatar, data, "test");
+            var menuItem = menuRoot.GetComponentsInChildren<ModularAvatarMenuItem>(true)
+                .Single(i => i.transform != menuRoot.transform);
+            var menu = new ToggleMenuBackup();
+            var snapshot = menu.Capture(avatar);
+            menuItem.isDefault = false;
+            menuItem.Control.name = "Changed";
+            menuItem.Control.parameter.name = "ChangedParameter";
+            var marker = menuItem.transform.Find("KaihenNavi_OriginalVisibility");
+            marker.gameObject.SetActive(false);
+            Recorded.Clear();
+            menu.Restore(avatar, snapshot, "restore");
+            Check(menuItem.isDefault && menuItem.Control.name == "Outfit" &&
+                menuItem.Control.parameter.name == "OutfitParameter", "Existing menu restores defaults and control data by item path");
+            Check(Recorded.Contains(menuItem) && marker.gameObject.activeSelf &&
+                ReferenceEquals(menuRoot.transform, go.transform.Find(ToggleFeature.MenuObjectName)),
+                "Existing menu records Undo and restores original visibility without replacing its root");
+            // 古いバックアップは項目のパスが無いのでパラメータで照合する。
+            data.items[0].itemPath = null;
+            var legacy = JsonUtility.ToJson(data);
+            menuItem.isDefault = false;
+            menu.Restore(avatar, legacy, "restore");
+            Check(menuItem.isDefault, "Legacy menu data matches existing items by parameter");
+            data.items[0].parameter = "NotFound";
+            menuItem.isDefault = false;
+            menu.Restore(avatar, legacy, "restore");
+            Check(!menuItem.isDefault, "Unmatched menu items are not modified");
+            menu.Restore(avatar, null, "restore");
+            menu.Restore(avatar, "invalid", "restore");
+            Check(!menuItem.isDefault, "Missing and invalid menu snapshots leave existing items alone");
+
+            var body = Child(go, "Body");
+            var hider = Child(outfit, SkinFeature.HiderObjectName).AddComponent<ModularAvatarShapeChanger>();
+            var reference = new AvatarObjectReference();
+            reference.Set(body);
+            hider.Shapes = new List<ChangedShape> { new ChangedShape { Object = reference,
+                ShapeName = "Shrink", ChangeType = ShapeChangeType.Set, Value = 73f } };
+            var other = Child(outfit, "UserShapeChanger").AddComponent<ModularAvatarShapeChanger>();
+            other.Shapes = new List<ChangedShape>();
+            var skin = new SkinShapeBackup();
+            snapshot = skin.Capture(avatar);
+            hider.Shapes.Clear();
+            Recorded.Clear();
+            skin.Restore(avatar, snapshot, "restore");
+            var restored = hider.Shapes.Single();
+            Check(restored.ShapeName == "Shrink" && restored.ChangeType == ShapeChangeType.Set && restored.Value == 73f &&
+                restored.Object.Get(hider) == body, "Existing skin changer restores a removed shape and its target");
+            Check(Recorded.Contains(hider) && !Recorded.Contains(other), "Skin restore records only tool-managed changers");
+            typeof(SkinFeature).GetMethod("RemoveShape", Static).Invoke(null, new object[] { outfit, body.AddComponent<SkinnedMeshRenderer>(), "Shrink", "test" });
+            Check(hider.Shapes.Count == 0, "SkinFeature.RemoveShape removes an existing managed shape");
+            skin.Restore(avatar, snapshot, "restore");
+            Check(hider.Shapes.Count == 1 && hider.Shapes[0].Value == 73f, "Snapshot restores the setting removed by RemoveShape");
+            hider.Shapes.Clear();
+            var empty = skin.Capture(avatar);
+            hider.Shapes.Add(restored);
+            skin.Restore(avatar, empty, "restore");
+            Check(hider.Shapes.Count == 0, "An empty saved Shapes list clears later edits");
+            skin.Restore(avatar, null, "restore");
+            skin.Restore(avatar, "invalid", "restore");
+            skin.Restore(null, snapshot, "restore");
+            Check(hider.Shapes.Count == 0, "Missing and invalid skin data do not change a changer");
+            body.transform.SetParent(null, false);
+            skin.Restore(avatar, snapshot, "restore");
+            Check(hider.Shapes.Single().Object.Get(hider) == null, "Missing shape targets restore as unbound references");
+
+            var a = new RuntimeAnimatorController { name = "A" };
+            var b = new RuntimeAnimatorController { name = "B" };
+            Assets["Assets/A.controller"] = a;
+            AssetDatabase.GuidForTests = path => "controller-guid";
+            AssetDatabase.PathFromGuidForTests = guid => guid == "controller-guid" ? "Assets/Moved.controller" : "";
+            AssetDatabase.LoadAllForTests = path => path == "Assets/Moved.controller" ? new Object[] { b, a } : new Object[0];
+            AssetDatabase.LocalIdForTests = obj => ReferenceEquals(obj, a) ? 42 : 43;
+            var walk = Child(go, WalkFeature.WalkObjectName).AddComponent<ModularAvatarMergeAnimator>();
+            walk.animator = a;
+            walk.layerType = VRCAvatarDescriptor.AnimLayerType.Base;
+            walk.mergeAnimatorMode = MergeAnimatorMode.Replace;
+            walk.pathMode = MergeAnimatorPathMode.Absolute;
+            walk.matchAvatarWriteDefaults = true;
+            walk.deleteAttachedAnimator = true;
+            walk.layerPriority = 7;
+            var userWalk = Child(go, "UserWalk").AddComponent<ModularAvatarMergeAnimator>();
+            userWalk.animator = b;
+            var walkBackup = new WalkAnimatorBackup();
+            snapshot = walkBackup.Capture(avatar);
+            Check(((IList)snapshots[snapshot].GetType().GetField("entries").GetValue(snapshots[snapshot])).Count == 1,
+                "Walk capture includes only the managed direct child");
+            walk.animator = b;
+            walk.layerType = VRCAvatarDescriptor.AnimLayerType.FX;
+            walk.mergeAnimatorMode = MergeAnimatorMode.Append;
+            walk.pathMode = MergeAnimatorPathMode.Relative;
+            walk.matchAvatarWriteDefaults = false;
+            walk.deleteAttachedAnimator = false;
+            walk.layerPriority = 0;
+            Recorded.Clear();
+            walkBackup.Restore(avatar, snapshot, "restore");
+            Check(walk.animator == a, "Existing walk restores controller A after B, using GUID and local ID even after an asset move");
+            Check(walk.layerType == VRCAvatarDescriptor.AnimLayerType.Base && walk.mergeAnimatorMode == MergeAnimatorMode.Replace &&
+                walk.pathMode == MergeAnimatorPathMode.Absolute && walk.matchAvatarWriteDefaults && walk.deleteAttachedAnimator &&
+                walk.layerPriority == 7, "Walk restores Merge Animator settings");
+            Check(Recorded.Contains(walk) && !Recorded.Contains(userWalk) && userWalk.animator == b,
+                "Walk restore records Undo without touching user Merge Animators");
+            walk.animator = null;
+            empty = walkBackup.Capture(avatar);
+            walk.animator = b;
+            walkBackup.Restore(avatar, empty, "restore");
+            Check(walk.animator == null, "A saved null walk controller clears a later assignment");
+            walk.animator = b;
+            walkBackup.Restore(avatar, null, "restore");
+            walkBackup.Restore(avatar, "invalid", "restore");
+            Check(walk.animator == b, "Missing and invalid walk data leave existing controllers alone");
+            AssetDatabase.LoadAllForTests = path => new Object[0];
+            walkBackup.Restore(avatar, snapshot, "restore");
+            Check(walk.animator == null, "A missing saved controller does not retain the later controller");
+            walk.transform.SetParent(null, false);
+            walkBackup.Restore(avatar, snapshot, "restore");
+            Check(walk.animator == null, "Missing walk objects are skipped without editing other objects");
+            Assets.Remove("Assets/A.controller");
+        }
+        finally
+        {
+            JsonUtility.SerializeForTests = serialize;
+            JsonUtility.DeserializeForTests = deserialize;
+            AssetDatabase.GuidForTests = guidFor;
+            AssetDatabase.PathFromGuidForTests = pathFromGuid;
+            AssetDatabase.LoadAllForTests = loadAll;
+            AssetDatabase.LocalIdForTests = localId;
+        }
+    }
+
     public static void Main()
     {
         VisualElement.StyleForTests = () => new Style();
@@ -134,7 +297,10 @@ internal static class HistoryTests
         Undo.RecordForTests = target => Recorded.Add(target);
         EditorApplication.timeSinceStartup = 3600;
         GlobalObjectId.IdForTests = o => "GlobalObjectId_V1-2-0123456789abcdef0123456789abcdef-" + o.name + "-0";
-        // JSON を扱う参加機能の挙動は本物の Unity で確認する。このテストでは履歴自身に絞る。
+        var participants = (IList)typeof(BackupService).GetField("Participants", Static).GetValue(null);
+        Check(participants.Cast<IBackupParticipant>().Any(p => p is SkinShapeBackup) &&
+            participants.Cast<IBackupParticipant>().Any(p => p is WalkAnimatorBackup), "Skin and walk participants are registered");
+        // 履歴自身のテストでは参加機能を外し、末尾で各参加機能の復元を別に確認する。
         ((IList)typeof(BackupService).GetField("Participants", Static).GetValue(null)).Clear();
         var go = new GameObject { name = "テスト用アバター" };
         var root = new Transform { gameObject = go, name = "Root", localScale = new Vector3(1, 1, 1) };
@@ -409,6 +575,7 @@ internal static class HistoryTests
         Call(body, "OnPointerDown", ctx, new PointerDownEvent());
         Check((int)typeof(BodyFeature).GetField("_selected", Static).GetValue(null) == 1 && repaints == 3 && rebuilds == 0 && Recorded.Count == 0,
             "Selecting a silhouette point repaints locally without editing or rebuilding");
+        ParticipantRestoreChecks();
         Console.WriteLine("History and body checks passed (" + _checks + "). Native Undo, Prefab saving and rendering require Unity.");
     }
 }

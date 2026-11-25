@@ -46,6 +46,8 @@ namespace Jeni.KaihenNavi
 #if KAIHENNAVI_MA
             new BodyScaleBackup(),
             new MeshSettingsBackup(),
+            new SkinShapeBackup(),
+            new WalkAnimatorBackup(),
 #endif
         };
 

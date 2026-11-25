@@ -660,6 +660,7 @@ namespace Jeni.KaihenNavi
 
                 data.items.Add(new MenuItemData
                 {
+                    itemPath = HierarchyPath.Get(menuRoot, item.transform),
                     label = item.gameObject.name,
                     parameter = item.Control != null && item.Control.parameter != null ? item.Control.parameter.name : "",
                     targetPath = HierarchyPath.Get(avatar.transform, target.transform),
@@ -671,6 +672,62 @@ namespace Jeni.KaihenNavi
             }
 
             return data;
+        }
+
+        internal static void RestoreMenu(VRCAvatarDescriptor avatar, MenuData data, string undoName)
+        {
+            if (data.items == null) return;
+            var root = avatar.transform.Find(MenuObjectName);
+            if (root == null) { BuildMenu(avatar, data, undoName); return; }
+            var rootItem = root.GetComponent<ModularAvatarMenuItem>();
+            if (rootItem != null && rootItem.Control != null)
+            {
+                Undo.RecordObject(rootItem, undoName);
+                rootItem.Control.name = data.menuName;
+                PrefabUtility.RecordPrefabInstancePropertyModifications(rootItem);
+                EditorUtility.SetDirty(rootItem);
+            }
+
+            var items = root.GetComponentsInChildren<ModularAvatarMenuItem>(true);
+            foreach (var spec in data.items)
+            {
+                if (spec == null) continue;
+                var t = string.IsNullOrEmpty(spec.itemPath) ? null : HierarchyPath.Find(root, spec.itemPath);
+                var item = t == null ? null : t.GetComponent<ModularAvatarMenuItem>();
+                if (item == null && !string.IsNullOrEmpty(spec.parameter))
+                    item = items.FirstOrDefault(i => i.transform != root && i.Control != null &&
+                        i.Control.parameter != null && i.Control.parameter.name == spec.parameter);
+                if (item == null) continue;
+                Undo.RecordObject(item, undoName);
+                item.isDefault = spec.isDefault;
+                if (item.Control != null)
+                {
+                    item.Control.name = spec.label;
+                    item.Control.parameter = new VRCExpressionsMenu.Control.Parameter { name = spec.parameter };
+                }
+                PrefabUtility.RecordPrefabInstancePropertyModifications(item);
+                EditorUtility.SetDirty(item);
+
+                var toggle = item.GetComponent<ModularAvatarObjectToggle>();
+                var target = HierarchyPath.Find(avatar.transform, spec.targetPath);
+                if (toggle != null && target != null)
+                {
+                    Undo.RecordObject(toggle, undoName);
+                    var reference = new AvatarObjectReference();
+                    reference.Set(target.gameObject);
+                    toggle.Objects = new List<ToggledObject> { new ToggledObject { Object = reference, Active = true } };
+                    PrefabUtility.RecordPrefabInstancePropertyModifications(toggle);
+                    EditorUtility.SetDirty(toggle);
+                }
+
+                var visibility = item.transform.Find(VisibilityName);
+                if (spec.hasOriginalActive && visibility != null)
+                {
+                    Undo.RecordObject(visibility.gameObject, undoName);
+                    visibility.gameObject.SetActive(spec.originalActive);
+                    PrefabUtility.RecordPrefabInstancePropertyModifications(visibility.gameObject);
+                }
+            }
         }
 #else
         // ---------------------------------------------------------------- MA なし
@@ -730,6 +787,7 @@ namespace Jeni.KaihenNavi
     [System.Serializable]
     internal sealed class MenuItemData
     {
+        public string itemPath = "";
         public string label = "";
         public string parameter = "";
         public string targetPath = "";
@@ -758,10 +816,9 @@ namespace Jeni.KaihenNavi
         public void Restore(VRCAvatarDescriptor avatar, string json, string undoName)
         {
 #if KAIHENNAVI_MA
-            if (string.IsNullOrEmpty(json)) return;
-            if (avatar.transform.Find(ToggleFeature.MenuObjectName) != null) return; // まだ残っていればそのまま
+            if (avatar == null || string.IsNullOrEmpty(json)) return;
             var data = JsonUtility.FromJson<MenuData>(json);
-            if (data != null) ToggleFeature.BuildMenu(avatar, data, undoName);
+            if (data != null) ToggleFeature.RestoreMenu(avatar, data, undoName);
 #endif
         }
     }
