@@ -144,6 +144,11 @@ namespace Jeni.KaihenNavi
         {
             Backup.NoteCreated(Avatar, created);
         }
+
+        public void NoteRemoved(GameObject removed)
+        {
+            Backup.NoteRemoved(Avatar, removed);
+        }
     }
 
     /// <summary>製品版で追加する予定の機能（カードだけ表示する）。</summary>

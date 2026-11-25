@@ -125,6 +125,9 @@ namespace Jeni.KaihenNavi
             {
                 foreach (var path in snapshot.createdPaths)
                     if (!_current.createdPaths.Contains(path)) _current.createdPaths.Add(path);
+                if (_current.removedObjects == null) _current.removedObjects = new List<BackupSnapshot.RemovedObject>();
+                _current.removedObjects.AddRange(snapshot.removedObjects);
+                snapshot.removedObjects.Clear();
                 SaveMetadata(_current);
                 ReleaseUnsaved(snapshot);
                 MarkLive(_current, _editingAvatar, group);
@@ -197,6 +200,53 @@ namespace Jeni.KaihenNavi
             // 作った物の記録も Undo で戻す（取り消した作成物を「作った物」として残さない）
             if (snapshot != _pending) Undo.RecordObject(snapshot, Undo.GetCurrentGroupName());
             snapshot.createdPaths.Add(path);
+            if (snapshot != _pending) SaveMetadata(snapshot);
+        }
+
+        /// <summary>削除直前の階層を複製して保存する。元の Prefab には適用しない。</summary>
+        public void NoteRemoved(VRCAvatarDescriptor avatar, GameObject removed)
+        {
+            var snapshot = _pending ?? _current;
+            if (snapshot == null || avatar == null || removed == null || removed == avatar.gameObject) return;
+            var parent = removed.transform.parent;
+            var parentPath = HierarchyPath.Get(avatar.transform, parent);
+            if (parentPath == null) return;
+            var folder = WorkFolders.Ensure(WorkFolders.Backups(avatar.gameObject) + "/Removed");
+            var path = folder + "/Removed_" + Guid.NewGuid().ToString("N") + ".prefab";
+            GameObject copy = null;
+            try
+            {
+                var source = removed;
+                // Prefab の一部分はそのまま保存できないので、切り離した複製だけを保存する。
+                if (PrefabUtility.IsPartOfPrefabInstance(removed) && !PrefabUtility.IsAnyPrefabInstanceRoot(removed))
+                {
+                    copy = Object.Instantiate(removed);
+                    if (PrefabUtility.IsPartOfPrefabInstance(copy))
+                        PrefabUtility.UnpackPrefabInstance(copy, PrefabUnpackMode.Completely, InteractionMode.AutomatedAction);
+                    source = copy;
+                }
+                if (PrefabUtility.SaveAsPrefabAsset(source, path) == null)
+                    throw new InvalidOperationException("Could not save removed object: " + removed.name);
+            }
+            catch
+            {
+                AssetDatabase.DeleteAsset(path);
+                throw;
+            }
+            finally
+            {
+                if (copy != null) Object.DestroyImmediate(copy);
+            }
+            if (snapshot != _pending) Undo.RecordObject(snapshot, Undo.GetCurrentGroupName());
+            if (snapshot.removedObjects == null) snapshot.removedObjects = new List<BackupSnapshot.RemovedObject>();
+            snapshot.removedObjects.Add(new BackupSnapshot.RemovedObject
+            {
+                objectPath = HierarchyPath.Get(avatar.transform, removed.transform),
+                parentPath = parentPath,
+                siblingIndex = removed.transform.GetSiblingIndex(),
+                objectName = removed.name,
+                prefabPath = path,
+            });
             if (snapshot != _pending) SaveMetadata(snapshot);
         }
 
@@ -330,6 +380,7 @@ namespace Jeni.KaihenNavi
                 var path = AssetDatabase.GetAssetPath(snapshot);
                 if (string.IsNullOrEmpty(path) || EditorUtility.IsDirty(snapshot)) continue;
                 if (lastWrite(path) >= sessionStart) continue;
+                if (RemovedPrefabs(snapshot).Any(p => lastWrite(p) >= sessionStart)) continue;
                 paths.Add(path);
             }
             if (paths.Count == 0) return 0;
@@ -337,7 +388,13 @@ namespace Jeni.KaihenNavi
             AssetDatabase.StartAssetEditing();
             try
             {
-                foreach (var path in paths) AssetDatabase.DeleteAsset(path);
+                foreach (var path in paths)
+                {
+                    var snapshot = AssetDatabase.LoadAssetAtPath<BackupSnapshot>(path);
+                    var removed = RemovedPrefabs(snapshot).ToList();
+                    if (!AssetDatabase.DeleteAsset(path)) continue;
+                    foreach (var prefab in removed) AssetDatabase.DeleteAsset(prefab);
+                }
             }
             finally
             {
@@ -554,7 +611,11 @@ namespace Jeni.KaihenNavi
             var group = Undo.GetCurrentGroup();
             Undo.SetCurrentGroupName(L10n.Tr("undo.restore"));
 
-            foreach (var snapshot in newer) DeleteCreated(avatar, snapshot);
+            foreach (var snapshot in newer)
+            {
+                DeleteCreated(avatar, snapshot);
+                RestoreRemoved(avatar, snapshot);
+            }
             RestoreExtras(avatar, target);
             Apply(avatar, target);
 
@@ -716,6 +777,7 @@ namespace Jeni.KaihenNavi
 
         private static void ReleaseUnsaved(BackupSnapshot snapshot)
         {
+            foreach (var path in RemovedPrefabs(snapshot)) AssetDatabase.DeleteAsset(path);
             foreach (var material in snapshot.materials)
                 if (material.saved != null) Object.DestroyImmediate(material.saved);
             Object.DestroyImmediate(snapshot);
@@ -735,6 +797,45 @@ namespace Jeni.KaihenNavi
         }
 
         // ---------------------------------------------------------------- 復元
+
+        private static IEnumerable<string> RemovedPrefabs(BackupSnapshot snapshot)
+        {
+            if (snapshot == null || snapshot.removedObjects == null) return Enumerable.Empty<string>();
+            return snapshot.removedObjects.Where(r => r != null && !string.IsNullOrEmpty(r.prefabPath) &&
+                r.prefabPath.StartsWith(WorkFolders.Root + "/", StringComparison.Ordinal) &&
+                r.prefabPath.Contains("/Backups/Removed/") && r.prefabPath.EndsWith(".prefab", StringComparison.Ordinal))
+                .Select(r => r.prefabPath).Distinct();
+        }
+
+        private static void RestoreRemoved(VRCAvatarDescriptor avatar, BackupSnapshot snapshot)
+        {
+            if (snapshot.removedObjects == null) return;
+            var undoName = L10n.Tr("undo.restore");
+            // 同じ親から続けて外した物は、外した順の逆に挿し戻す。
+            foreach (var record in snapshot.removedObjects.AsEnumerable().Reverse())
+            {
+                if (record == null) continue;
+                if (record.objectPath != null && snapshot.createdPaths.Any(p => record.objectPath == p ||
+                    record.objectPath.StartsWith(p + "/", StringComparison.Ordinal))) continue;
+                var parent = HierarchyPath.Find(avatar.transform, record.parentPath);
+                if (parent == null) continue;
+                var exists = false;
+                foreach (Transform child in parent)
+                    if (child.name == record.objectName) { exists = true; break; }
+                if (exists) continue;
+                var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(record.prefabPath);
+                if (prefab == null) continue;
+                var instance = PrefabUtility.InstantiatePrefab(prefab) as GameObject;
+                if (instance == null) continue;
+                Undo.RegisterCreatedObjectUndo(instance, undoName);
+                Undo.SetTransformParent(instance.transform, parent, undoName);
+                Undo.RecordObject(instance, undoName);
+                Undo.RecordObject(instance.transform, undoName);
+                instance.name = record.objectName;
+                instance.transform.SetSiblingIndex(record.siblingIndex);
+                PrefabUtility.UnpackPrefabInstance(instance, PrefabUnpackMode.OutermostRoot, InteractionMode.UserAction);
+            }
+        }
 
         private static void DeleteCreated(VRCAvatarDescriptor avatar, BackupSnapshot snapshot)
         {

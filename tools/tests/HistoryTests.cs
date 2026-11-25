@@ -281,6 +281,206 @@ internal static class HistoryTests
         }
     }
 
+    private static GameObject CopyHierarchy(GameObject source)
+    {
+        var copy = new GameObject(source.name);
+        copy.SetActive(source.activeSelf);
+        copy.transform.localPosition = source.transform.localPosition;
+        copy.transform.localRotation = source.transform.localRotation;
+        copy.transform.localScale = source.transform.localScale;
+        foreach (Transform child in source.transform) CopyHierarchy(child.gameObject).transform.SetParent(copy.transform, false);
+        return copy;
+    }
+
+    /// <summary>Prefab のファイル入出力だけ差し替え、削除の記録・挿し戻し・整理の順序を確認する。</summary>
+    private static void RemovedObjectChecks()
+    {
+        var save = PrefabUtility.SaveForTests;
+        var instantiate = PrefabUtility.InstantiateForTests;
+        var unpack = PrefabUtility.UnpackForTests;
+        var prefabRoot = PrefabUtility.RootForTests;
+        var create = AssetDatabase.CreateForTests;
+        var load = AssetDatabase.LoadForTests;
+        var find = AssetDatabase.FindForTests;
+        var pathFor = AssetDatabase.PathForTests;
+        var delete = AssetDatabase.DeleteForTests;
+        var created = Undo.CreatedForTests;
+        var deserialize = JsonUtility.DeserializeForTests;
+        var assets = new Dictionary<string, Object>();
+        try
+        {
+            PrefabUtility.RootForTests = null;
+            AssetDatabase.CreateForTests = (asset, path) => assets.Add(path, asset);
+            AssetDatabase.LoadForTests = path => path != null && assets.ContainsKey(path) ? assets[path] : null;
+            AssetDatabase.FindForTests = (filter, folders) => assets.Where(p => p.Value is BackupSnapshot).Select(p => p.Key).ToArray();
+            AssetDatabase.PathForTests = asset => assets.FirstOrDefault(p => ReferenceEquals(p.Value, asset)).Key;
+            var deleted = new List<string>();
+            AssetDatabase.DeleteForTests = path => { deleted.Add(path); assets.Remove(path); };
+            var savedSources = new List<GameObject>();
+            PrefabUtility.SaveForTests = (source, path) =>
+            {
+                savedSources.Add(source);
+                var prefab = CopyHierarchy(source);
+                assets.Add(path, prefab);
+                return prefab;
+            };
+            PrefabUtility.InstantiateForTests = asset => CopyHierarchy((GameObject)asset);
+            var unpacked = new List<GameObject>();
+            PrefabUtility.UnpackForTests = (instance, mode, interaction) =>
+            {
+                Check(mode == PrefabUnpackMode.OutermostRoot && interaction == InteractionMode.UserAction,
+                    "Restored objects unpack one level with Undo support");
+                unpacked.Add(instance);
+            };
+            var undoCreated = new List<Object>();
+            Undo.CreatedForTests = obj => undoCreated.Add(obj);
+            BackupService.InvalidateCache();
+            var go = new GameObject("RemovedAvatar");
+            var avatar = go.AddComponent<VRCAvatarDescriptor>();
+            var parent = Child(go, "Clothes");
+            Child(parent, "Before");
+            var outfit = Child(parent, "Outfit");
+            outfit.transform.localPosition = new Vector3(1, 2, 3);
+            Child(outfit, "Mesh");
+            Child(parent, "After");
+            var backup = new BackupService();
+            backup.BeginEdit(avatar, "outfit");
+            backup.NoteRemoved(avatar, outfit);
+            var pending = (BackupSnapshot)Get(backup, "_pending");
+            var record = pending.removedObjects.Single();
+            Check(record.parentPath == HierarchyPath.Get(go.transform, parent.transform) && record.siblingIndex == 1 &&
+                record.objectName == "Outfit" && record.prefabPath.Contains("/Backups/Removed/"),
+                "Removal records the original parent, sibling index, name and tool-owned prefab path");
+            Check(undoCreated.Count == 0 && savedSources.Single() == outfit && parent.transform.GetChild(1) == outfit.transform,
+                "Saving a removal neither reconnects the original nor creates Undo objects");
+            Undo.DestroyObjectImmediate(outfit);
+            Finish(backup, "Remove outfit");
+            var snapshot = backup.List(avatar).First();
+            var snapshotPath = AssetDatabase.GetAssetPath(snapshot);
+            new BackupService().Restore(avatar, snapshot);
+            var restored = parent.transform.GetChild(1).gameObject;
+            Check(restored.name == "Outfit" && restored.transform.parent == parent.transform &&
+                parent.transform.GetChild(2).name == "After" && restored.transform.Find("Mesh") != null,
+                "Persistent restore recreates the removed hierarchy at its original parent and sibling index");
+            Check(restored.transform.localPosition == new Vector3(1, 2, 3) && undoCreated.Contains(restored) && unpacked.Contains(restored),
+                "Restored hierarchy exists before transforms apply and is registered for Undo");
+            snapshot.hiddenFromHistory = false;
+            new BackupService().Restore(avatar, snapshot);
+            Check(parent.transform.childCount == 3 && undoCreated.Count == 1, "Restoring twice does not duplicate a present object");
+            Undo.DestroyObjectImmediate(restored);
+            parent.transform.SetParent(null, false);
+            snapshot.hiddenFromHistory = false;
+            new BackupService().Restore(avatar, snapshot);
+            Check(undoCreated.Count == 1, "A missing parent skips the removed object");
+            parent.transform.SetParent(go.transform, false);
+            assets.Remove(record.prefabPath);
+            snapshot.hiddenFromHistory = false;
+            new BackupService().Restore(avatar, snapshot);
+            Check(parent.transform.childCount == 2 && undoCreated.Count == 1, "A missing saved prefab is skipped");
+            assets[record.prefabPath] = new GameObject("Saved outfit");
+            snapshot.hiddenFromHistory = true;
+            deleted.Clear();
+            BackupService.DeleteStale(BackupService.SessionStart, path => path == record.prefabPath ? DateTime.MaxValue : DateTime.MinValue);
+            Check(!deleted.Contains(snapshotPath) && !deleted.Contains(record.prefabPath),
+                "A removed prefab written during this session retains its snapshot for Undo");
+            BackupService.DeleteStale(BackupService.SessionStart, path => DateTime.MinValue);
+            Check(deleted.Contains(snapshotPath) && deleted.Contains(record.prefabPath), "Deleting an old hidden snapshot also deletes its saved removed prefab");
+
+            // Unity の JSON 本体は再現せず、旧データの既知フィールドだけを読み込む。
+            JsonUtility.DeserializeForTests = (json, type) =>
+            {
+                var old = FlatJson.Parse(json);
+                return new BackupSnapshot { avatarName = old["avatarName"] };
+            };
+            var legacy = JsonUtility.FromJson<BackupSnapshot>("{\"avatarName\":\"Legacy\"}");
+            Check(legacy.avatarName == "Legacy" && legacy.removedObjects != null && legacy.removedObjects.Count == 0,
+                "Old snapshot data without removedObjects retains an empty initialized list");
+            legacy.removedObjects = null;
+            legacy.avatarId = BackupService.AvatarId(avatar);
+            legacy.createdTicks = DateTime.Now.Ticks;
+            assets.Add(WorkFolders.Backups(go) + "/legacy.asset", legacy);
+            BackupService.InvalidateCache();
+            new BackupService().Restore(avatar, legacy);
+            Check(undoCreated.Count == 1, "Legacy null removal lists are also safe during restore");
+            JsonUtility.DeserializeForTests = deserialize;
+
+            var cancel = new BackupService();
+            cancel.BeginEdit(avatar, "outfit");
+            cancel.NoteRemoved(avatar, parent);
+            var cancelPath = ((BackupSnapshot)Get(cancel, "_pending")).removedObjects.Single().prefabPath;
+            cancel.CancelPending();
+            Check(!assets.ContainsKey(cancelPath), "Cancelling an unsaved snapshot removes its unused prefab copy");
+
+            var merge = new BackupService();
+            merge.BeginEdit(avatar, "outfit");
+            merge.NoteRemoved(avatar, parent);
+            Finish(merge, "Merge removal");
+            var merged = merge.List(avatar).First();
+            merge.BeginEdit(avatar, "outfit");
+            merge.NoteRemoved(avatar, parent);
+            var transferred = ((BackupSnapshot)Get(merge, "_pending")).removedObjects.Single().prefabPath;
+            merge.CompletePending(Undo.GetCurrentGroup());
+            Check(merged.removedObjects.Count == 2 && assets.ContainsKey(transferred),
+                "Merging a step transfers removal records without deleting their saved prefabs");
+            merge.EndSession();
+
+            var sameStep = new BackupService();
+            sameStep.BeginEdit(avatar, "outfit");
+            var added = Child(go, "AddedThenRemoved");
+            sameStep.NoteCreated(avatar, added);
+            sameStep.NoteRemoved(avatar, added);
+            Undo.DestroyObjectImmediate(added);
+            Finish(sameStep, "Create and remove");
+            new BackupService().Restore(avatar, sameStep.List(avatar).First());
+            Check(go.transform.Find("AddedThenRemoved") == null, "An object created and removed within one snapshot is not resurrected");
+
+            var failure = new BackupService();
+            failure.BeginEdit(avatar, "outfit");
+            PrefabUtility.SaveForTests = (source, path) => null;
+            var threw = false;
+            try { failure.NoteRemoved(avatar, parent); } catch (InvalidOperationException) { threw = true; }
+            Check(threw && ((BackupSnapshot)Get(failure, "_pending")).removedObjects.Count == 0 && parent.transform.parent == go.transform,
+                "A failed prefab save aborts before a removal can destroy the original");
+            failure.CancelPending();
+
+            var layered = new BackupService();
+            layered.BeginEdit(avatar, "outfit");
+            var later = Child(go, "LaterOutfit");
+            layered.NoteCreated(avatar, later);
+            Finish(layered, "Add later outfit");
+            var beforeCreation = layered.List(avatar).First();
+            layered.EndSession();
+            layered.BeginEdit(avatar, "outfit");
+            PrefabUtility.SaveForTests = (source, path) =>
+            {
+                var prefab = CopyHierarchy(source);
+                assets.Add(path, prefab);
+                return prefab;
+            };
+            layered.NoteRemoved(avatar, later);
+            Undo.DestroyObjectImmediate(later);
+            Finish(layered, "Remove later outfit");
+            new BackupService().Restore(avatar, beforeCreation);
+            Check(go.transform.Find("LaterOutfit") == null,
+                "Restoring across creation and later deletion reverses each snapshot in order");
+        }
+        finally
+        {
+            PrefabUtility.SaveForTests = save;
+            PrefabUtility.InstantiateForTests = instantiate;
+            PrefabUtility.UnpackForTests = unpack;
+            PrefabUtility.RootForTests = prefabRoot;
+            AssetDatabase.CreateForTests = create;
+            AssetDatabase.LoadForTests = load;
+            AssetDatabase.FindForTests = find;
+            AssetDatabase.PathForTests = pathFor;
+            AssetDatabase.DeleteForTests = delete;
+            Undo.CreatedForTests = created;
+            JsonUtility.DeserializeForTests = deserialize;
+            BackupService.InvalidateCache();
+        }
+    }
+
     public static void Main()
     {
         VisualElement.StyleForTests = () => new Style();
@@ -576,6 +776,7 @@ internal static class HistoryTests
         Check((int)typeof(BodyFeature).GetField("_selected", Static).GetValue(null) == 1 && repaints == 3 && rebuilds == 0 && Recorded.Count == 0,
             "Selecting a silhouette point repaints locally without editing or rebuilding");
         ParticipantRestoreChecks();
+        RemovedObjectChecks();
         Console.WriteLine("History and body checks passed (" + _checks + "). Native Undo, Prefab saving and rendering require Unity.");
     }
 }

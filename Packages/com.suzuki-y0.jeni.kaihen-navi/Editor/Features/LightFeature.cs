@@ -235,6 +235,7 @@ namespace Jeni.KaihenNavi
             Undo.IncrementCurrentGroup();
             var group = Undo.GetCurrentGroup();
             Undo.SetCurrentGroupName(undoName);
+            ctx.NoteRemoved(LightMenu.Find(ctx.Avatar));
             LightMenu.Remove(ctx.Avatar, undoName);
             ctx.CompleteEdit(group);
             ctx.Tell(L10n.Tr("light.slider.removed"));
