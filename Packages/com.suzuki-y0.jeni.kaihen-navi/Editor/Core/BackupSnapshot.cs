@@ -54,6 +54,16 @@ namespace Jeni.KaihenNavi
             public string json;
         }
 
+        [Serializable]
+        public sealed class RemovedObject
+        {
+            public string objectPath;
+            public string parentPath;
+            public int siblingIndex;
+            public string objectName;
+            public string prefabPath;
+        }
+
         /// <summary>アバターの識別子（GlobalObjectId）。同名アバターの取り違えを防ぐ。</summary>
         public string avatarId;
         public string avatarName;
@@ -82,6 +92,7 @@ namespace Jeni.KaihenNavi
 
         /// <summary>このバックアップの後にツールが作ったオブジェクト。元に戻すときに削除する。</summary>
         public List<string> createdPaths = new List<string>();
+        public List<RemovedObject> removedObjects = new List<RemovedObject>();
 
         public DateTime CreatedAt
         {

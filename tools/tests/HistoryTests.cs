@@ -9,6 +9,7 @@ using UnityEditor;
 using UnityEngine;
 using UnityEngine.UIElements;
 using VRC.SDK3.Avatars.Components;
+using nadena.dev.modular_avatar.core;
 using Object = UnityEngine.Object;
 
 /// <summary>Undo 本体は模倣せず、履歴の分類・保存・復元時の記録対象と、部位選択の副作用を確認する。</summary>
@@ -118,6 +119,368 @@ internal static class HistoryTests
         }
     }
 
+    private static GameObject Child(GameObject parent, string name)
+    {
+        var child = new GameObject(name);
+        child.transform.SetParent(parent.transform, false);
+        return child;
+    }
+
+    /// <summary>JSON の入出力だけ差し替え、既存コンポーネントの永続復元データと適用を確認する。</summary>
+    private static void ParticipantRestoreChecks()
+    {
+        var serialize = JsonUtility.SerializeForTests;
+        var deserialize = JsonUtility.DeserializeForTests;
+        var guidFor = AssetDatabase.GuidForTests;
+        var pathFromGuid = AssetDatabase.PathFromGuidForTests;
+        var loadAll = AssetDatabase.LoadAllForTests;
+        var localId = AssetDatabase.LocalIdForTests;
+        try
+        {
+            var snapshots = new Dictionary<string, object>();
+            JsonUtility.SerializeForTests = value =>
+            {
+                var key = "snapshot-" + snapshots.Count;
+                snapshots.Add(key, value);
+                return key;
+            };
+            JsonUtility.DeserializeForTests = (json, type) => snapshots.ContainsKey(json) ? snapshots[json] : null;
+            var go = new GameObject("RestoreAvatar");
+            var avatar = go.AddComponent<VRCAvatarDescriptor>();
+            var outfit = Child(go, "Outfit");
+            var data = new MenuData();
+            data.items.Add(new MenuItemData { label = "Outfit", parameter = "OutfitParameter",
+                targetPath = HierarchyPath.Get(go.transform, outfit.transform), isDefault = true,
+                hasOriginalActive = true, originalActive = true });
+            var menuRoot = ToggleFeature.BuildMenu(avatar, data, "test");
+            var menuItem = menuRoot.GetComponentsInChildren<ModularAvatarMenuItem>(true)
+                .Single(i => i.transform != menuRoot.transform);
+            var menu = new ToggleMenuBackup();
+            var snapshot = menu.Capture(avatar);
+            menuItem.isDefault = false;
+            menuItem.Control.name = "Changed";
+            menuItem.Control.parameter.name = "ChangedParameter";
+            var marker = menuItem.transform.Find("KaihenNavi_OriginalVisibility");
+            marker.gameObject.SetActive(false);
+            Recorded.Clear();
+            menu.Restore(avatar, snapshot, "restore");
+            Check(menuItem.isDefault && menuItem.Control.name == "Outfit" &&
+                menuItem.Control.parameter.name == "OutfitParameter", "Existing menu restores defaults and control data by item path");
+            Check(Recorded.Contains(menuItem) && marker.gameObject.activeSelf &&
+                ReferenceEquals(menuRoot.transform, go.transform.Find(ToggleFeature.MenuObjectName)),
+                "Existing menu records Undo and restores original visibility without replacing its root");
+            // 古いバックアップは項目のパスが無いのでパラメータで照合する。
+            data.items[0].itemPath = null;
+            var legacy = JsonUtility.ToJson(data);
+            menuItem.isDefault = false;
+            menu.Restore(avatar, legacy, "restore");
+            Check(menuItem.isDefault, "Legacy menu data matches existing items by parameter");
+            data.items[0].parameter = "NotFound";
+            menuItem.isDefault = false;
+            menu.Restore(avatar, legacy, "restore");
+            Check(!menuItem.isDefault, "Unmatched menu items are not modified");
+            menu.Restore(avatar, null, "restore");
+            menu.Restore(avatar, "invalid", "restore");
+            Check(!menuItem.isDefault, "Missing and invalid menu snapshots leave existing items alone");
+
+            var body = Child(go, "Body");
+            var hider = Child(outfit, SkinFeature.HiderObjectName).AddComponent<ModularAvatarShapeChanger>();
+            var reference = new AvatarObjectReference();
+            reference.Set(body);
+            hider.Shapes = new List<ChangedShape> { new ChangedShape { Object = reference,
+                ShapeName = "Shrink", ChangeType = ShapeChangeType.Set, Value = 73f } };
+            var other = Child(outfit, "UserShapeChanger").AddComponent<ModularAvatarShapeChanger>();
+            other.Shapes = new List<ChangedShape>();
+            var skin = new SkinShapeBackup();
+            snapshot = skin.Capture(avatar);
+            hider.Shapes.Clear();
+            Recorded.Clear();
+            skin.Restore(avatar, snapshot, "restore");
+            var restored = hider.Shapes.Single();
+            Check(restored.ShapeName == "Shrink" && restored.ChangeType == ShapeChangeType.Set && restored.Value == 73f &&
+                restored.Object.Get(hider) == body, "Existing skin changer restores a removed shape and its target");
+            Check(Recorded.Contains(hider) && !Recorded.Contains(other), "Skin restore records only tool-managed changers");
+            typeof(SkinFeature).GetMethod("RemoveShape", Static).Invoke(null, new object[] { outfit, body.AddComponent<SkinnedMeshRenderer>(), "Shrink", "test" });
+            Check(hider.Shapes.Count == 0, "SkinFeature.RemoveShape removes an existing managed shape");
+            skin.Restore(avatar, snapshot, "restore");
+            Check(hider.Shapes.Count == 1 && hider.Shapes[0].Value == 73f, "Snapshot restores the setting removed by RemoveShape");
+            hider.Shapes.Clear();
+            var empty = skin.Capture(avatar);
+            hider.Shapes.Add(restored);
+            skin.Restore(avatar, empty, "restore");
+            Check(hider.Shapes.Count == 0, "An empty saved Shapes list clears later edits");
+            skin.Restore(avatar, null, "restore");
+            skin.Restore(avatar, "invalid", "restore");
+            skin.Restore(null, snapshot, "restore");
+            Check(hider.Shapes.Count == 0, "Missing and invalid skin data do not change a changer");
+            body.transform.SetParent(null, false);
+            skin.Restore(avatar, snapshot, "restore");
+            Check(hider.Shapes.Single().Object.Get(hider) == null, "Missing shape targets restore as unbound references");
+
+            var a = new RuntimeAnimatorController { name = "A" };
+            var b = new RuntimeAnimatorController { name = "B" };
+            Assets["Assets/A.controller"] = a;
+            AssetDatabase.GuidForTests = path => "controller-guid";
+            AssetDatabase.PathFromGuidForTests = guid => guid == "controller-guid" ? "Assets/Moved.controller" : "";
+            AssetDatabase.LoadAllForTests = path => path == "Assets/Moved.controller" ? new Object[] { b, a } : new Object[0];
+            AssetDatabase.LocalIdForTests = obj => ReferenceEquals(obj, a) ? 42 : 43;
+            var walk = Child(go, WalkFeature.WalkObjectName).AddComponent<ModularAvatarMergeAnimator>();
+            walk.animator = a;
+            walk.layerType = VRCAvatarDescriptor.AnimLayerType.Base;
+            walk.mergeAnimatorMode = MergeAnimatorMode.Replace;
+            walk.pathMode = MergeAnimatorPathMode.Absolute;
+            walk.matchAvatarWriteDefaults = true;
+            walk.deleteAttachedAnimator = true;
+            walk.layerPriority = 7;
+            var userWalk = Child(go, "UserWalk").AddComponent<ModularAvatarMergeAnimator>();
+            userWalk.animator = b;
+            var walkBackup = new WalkAnimatorBackup();
+            snapshot = walkBackup.Capture(avatar);
+            Check(((IList)snapshots[snapshot].GetType().GetField("entries").GetValue(snapshots[snapshot])).Count == 1,
+                "Walk capture includes only the managed direct child");
+            walk.animator = b;
+            walk.layerType = VRCAvatarDescriptor.AnimLayerType.FX;
+            walk.mergeAnimatorMode = MergeAnimatorMode.Append;
+            walk.pathMode = MergeAnimatorPathMode.Relative;
+            walk.matchAvatarWriteDefaults = false;
+            walk.deleteAttachedAnimator = false;
+            walk.layerPriority = 0;
+            Recorded.Clear();
+            walkBackup.Restore(avatar, snapshot, "restore");
+            Check(walk.animator == a, "Existing walk restores controller A after B, using GUID and local ID even after an asset move");
+            Check(walk.layerType == VRCAvatarDescriptor.AnimLayerType.Base && walk.mergeAnimatorMode == MergeAnimatorMode.Replace &&
+                walk.pathMode == MergeAnimatorPathMode.Absolute && walk.matchAvatarWriteDefaults && walk.deleteAttachedAnimator &&
+                walk.layerPriority == 7, "Walk restores Merge Animator settings");
+            Check(Recorded.Contains(walk) && !Recorded.Contains(userWalk) && userWalk.animator == b,
+                "Walk restore records Undo without touching user Merge Animators");
+            walk.animator = null;
+            empty = walkBackup.Capture(avatar);
+            walk.animator = b;
+            walkBackup.Restore(avatar, empty, "restore");
+            Check(walk.animator == null, "A saved null walk controller clears a later assignment");
+            walk.animator = b;
+            walkBackup.Restore(avatar, null, "restore");
+            walkBackup.Restore(avatar, "invalid", "restore");
+            Check(walk.animator == b, "Missing and invalid walk data leave existing controllers alone");
+            AssetDatabase.LoadAllForTests = path => new Object[0];
+            walkBackup.Restore(avatar, snapshot, "restore");
+            Check(walk.animator == null, "A missing saved controller does not retain the later controller");
+            walk.transform.SetParent(null, false);
+            walkBackup.Restore(avatar, snapshot, "restore");
+            Check(walk.animator == null, "Missing walk objects are skipped without editing other objects");
+            Assets.Remove("Assets/A.controller");
+        }
+        finally
+        {
+            JsonUtility.SerializeForTests = serialize;
+            JsonUtility.DeserializeForTests = deserialize;
+            AssetDatabase.GuidForTests = guidFor;
+            AssetDatabase.PathFromGuidForTests = pathFromGuid;
+            AssetDatabase.LoadAllForTests = loadAll;
+            AssetDatabase.LocalIdForTests = localId;
+        }
+    }
+
+    private static GameObject CopyHierarchy(GameObject source)
+    {
+        var copy = new GameObject(source.name);
+        copy.SetActive(source.activeSelf);
+        copy.transform.localPosition = source.transform.localPosition;
+        copy.transform.localRotation = source.transform.localRotation;
+        copy.transform.localScale = source.transform.localScale;
+        foreach (Transform child in source.transform) CopyHierarchy(child.gameObject).transform.SetParent(copy.transform, false);
+        return copy;
+    }
+
+    /// <summary>Prefab のファイル入出力だけ差し替え、削除の記録・挿し戻し・整理の順序を確認する。</summary>
+    private static void RemovedObjectChecks()
+    {
+        var save = PrefabUtility.SaveForTests;
+        var instantiate = PrefabUtility.InstantiateForTests;
+        var unpack = PrefabUtility.UnpackForTests;
+        var prefabRoot = PrefabUtility.RootForTests;
+        var create = AssetDatabase.CreateForTests;
+        var load = AssetDatabase.LoadForTests;
+        var find = AssetDatabase.FindForTests;
+        var pathFor = AssetDatabase.PathForTests;
+        var delete = AssetDatabase.DeleteForTests;
+        var created = Undo.CreatedForTests;
+        var deserialize = JsonUtility.DeserializeForTests;
+        var assets = new Dictionary<string, Object>();
+        try
+        {
+            PrefabUtility.RootForTests = null;
+            AssetDatabase.CreateForTests = (asset, path) => assets.Add(path, asset);
+            AssetDatabase.LoadForTests = path => path != null && assets.ContainsKey(path) ? assets[path] : null;
+            AssetDatabase.FindForTests = (filter, folders) => assets.Where(p => p.Value is BackupSnapshot).Select(p => p.Key).ToArray();
+            AssetDatabase.PathForTests = asset => assets.FirstOrDefault(p => ReferenceEquals(p.Value, asset)).Key;
+            var deleted = new List<string>();
+            AssetDatabase.DeleteForTests = path => { deleted.Add(path); assets.Remove(path); };
+            var savedSources = new List<GameObject>();
+            PrefabUtility.SaveForTests = (source, path) =>
+            {
+                savedSources.Add(source);
+                var prefab = CopyHierarchy(source);
+                assets.Add(path, prefab);
+                return prefab;
+            };
+            PrefabUtility.InstantiateForTests = asset => CopyHierarchy((GameObject)asset);
+            var unpacked = new List<GameObject>();
+            PrefabUtility.UnpackForTests = (instance, mode, interaction) =>
+            {
+                Check(mode == PrefabUnpackMode.OutermostRoot && interaction == InteractionMode.UserAction,
+                    "Restored objects unpack one level with Undo support");
+                unpacked.Add(instance);
+            };
+            var undoCreated = new List<Object>();
+            Undo.CreatedForTests = obj => undoCreated.Add(obj);
+            BackupService.InvalidateCache();
+            var go = new GameObject("RemovedAvatar");
+            var avatar = go.AddComponent<VRCAvatarDescriptor>();
+            var parent = Child(go, "Clothes");
+            Child(parent, "Before");
+            var outfit = Child(parent, "Outfit");
+            outfit.transform.localPosition = new Vector3(1, 2, 3);
+            Child(outfit, "Mesh");
+            Child(parent, "After");
+            var backup = new BackupService();
+            backup.BeginEdit(avatar, "outfit");
+            backup.NoteRemoved(avatar, outfit);
+            var pending = (BackupSnapshot)Get(backup, "_pending");
+            var record = pending.removedObjects.Single();
+            Check(record.parentPath == HierarchyPath.Get(go.transform, parent.transform) && record.siblingIndex == 1 &&
+                record.objectName == "Outfit" && record.prefabPath.Contains("/Backups/Removed/"),
+                "Removal records the original parent, sibling index, name and tool-owned prefab path");
+            Check(undoCreated.Count == 0 && savedSources.Single() == outfit && parent.transform.GetChild(1) == outfit.transform,
+                "Saving a removal neither reconnects the original nor creates Undo objects");
+            Undo.DestroyObjectImmediate(outfit);
+            Finish(backup, "Remove outfit");
+            var snapshot = backup.List(avatar).First();
+            var snapshotPath = AssetDatabase.GetAssetPath(snapshot);
+            new BackupService().Restore(avatar, snapshot);
+            var restored = parent.transform.GetChild(1).gameObject;
+            Check(restored.name == "Outfit" && restored.transform.parent == parent.transform &&
+                parent.transform.GetChild(2).name == "After" && restored.transform.Find("Mesh") != null,
+                "Persistent restore recreates the removed hierarchy at its original parent and sibling index");
+            Check(restored.transform.localPosition == new Vector3(1, 2, 3) && undoCreated.Contains(restored) && unpacked.Contains(restored),
+                "Restored hierarchy exists before transforms apply and is registered for Undo");
+            snapshot.hiddenFromHistory = false;
+            new BackupService().Restore(avatar, snapshot);
+            Check(parent.transform.childCount == 3 && undoCreated.Count == 1, "Restoring twice does not duplicate a present object");
+            Undo.DestroyObjectImmediate(restored);
+            parent.transform.SetParent(null, false);
+            snapshot.hiddenFromHistory = false;
+            new BackupService().Restore(avatar, snapshot);
+            Check(undoCreated.Count == 1, "A missing parent skips the removed object");
+            parent.transform.SetParent(go.transform, false);
+            assets.Remove(record.prefabPath);
+            snapshot.hiddenFromHistory = false;
+            new BackupService().Restore(avatar, snapshot);
+            Check(parent.transform.childCount == 2 && undoCreated.Count == 1, "A missing saved prefab is skipped");
+            assets[record.prefabPath] = new GameObject("Saved outfit");
+            snapshot.hiddenFromHistory = true;
+            deleted.Clear();
+            BackupService.DeleteStale(BackupService.SessionStart, path => path == record.prefabPath ? DateTime.MaxValue : DateTime.MinValue);
+            Check(!deleted.Contains(snapshotPath) && !deleted.Contains(record.prefabPath),
+                "A removed prefab written during this session retains its snapshot for Undo");
+            BackupService.DeleteStale(BackupService.SessionStart, path => DateTime.MinValue);
+            Check(deleted.Contains(snapshotPath) && deleted.Contains(record.prefabPath), "Deleting an old hidden snapshot also deletes its saved removed prefab");
+
+            // Unity の JSON 本体は再現せず、旧データの既知フィールドだけを読み込む。
+            JsonUtility.DeserializeForTests = (json, type) =>
+            {
+                var old = FlatJson.Parse(json);
+                return new BackupSnapshot { avatarName = old["avatarName"] };
+            };
+            var legacy = JsonUtility.FromJson<BackupSnapshot>("{\"avatarName\":\"Legacy\"}");
+            Check(legacy.avatarName == "Legacy" && legacy.removedObjects != null && legacy.removedObjects.Count == 0,
+                "Old snapshot data without removedObjects retains an empty initialized list");
+            legacy.removedObjects = null;
+            legacy.avatarId = BackupService.AvatarId(avatar);
+            legacy.createdTicks = DateTime.Now.Ticks;
+            assets.Add(WorkFolders.Backups(go) + "/legacy.asset", legacy);
+            BackupService.InvalidateCache();
+            new BackupService().Restore(avatar, legacy);
+            Check(undoCreated.Count == 1, "Legacy null removal lists are also safe during restore");
+            JsonUtility.DeserializeForTests = deserialize;
+
+            var cancel = new BackupService();
+            cancel.BeginEdit(avatar, "outfit");
+            cancel.NoteRemoved(avatar, parent);
+            var cancelPath = ((BackupSnapshot)Get(cancel, "_pending")).removedObjects.Single().prefabPath;
+            cancel.CancelPending();
+            Check(!assets.ContainsKey(cancelPath), "Cancelling an unsaved snapshot removes its unused prefab copy");
+
+            var merge = new BackupService();
+            merge.BeginEdit(avatar, "outfit");
+            merge.NoteRemoved(avatar, parent);
+            Finish(merge, "Merge removal");
+            var merged = merge.List(avatar).First();
+            merge.BeginEdit(avatar, "outfit");
+            merge.NoteRemoved(avatar, parent);
+            var transferred = ((BackupSnapshot)Get(merge, "_pending")).removedObjects.Single().prefabPath;
+            merge.CompletePending(Undo.GetCurrentGroup());
+            Check(merged.removedObjects.Count == 2 && assets.ContainsKey(transferred),
+                "Merging a step transfers removal records without deleting their saved prefabs");
+            merge.EndSession();
+
+            var sameStep = new BackupService();
+            sameStep.BeginEdit(avatar, "outfit");
+            var added = Child(go, "AddedThenRemoved");
+            sameStep.NoteCreated(avatar, added);
+            sameStep.NoteRemoved(avatar, added);
+            Undo.DestroyObjectImmediate(added);
+            Finish(sameStep, "Create and remove");
+            new BackupService().Restore(avatar, sameStep.List(avatar).First());
+            Check(go.transform.Find("AddedThenRemoved") == null, "An object created and removed within one snapshot is not resurrected");
+
+            var failure = new BackupService();
+            failure.BeginEdit(avatar, "outfit");
+            PrefabUtility.SaveForTests = (source, path) => null;
+            var threw = false;
+            try { failure.NoteRemoved(avatar, parent); } catch (InvalidOperationException) { threw = true; }
+            Check(threw && ((BackupSnapshot)Get(failure, "_pending")).removedObjects.Count == 0 && parent.transform.parent == go.transform,
+                "A failed prefab save aborts before a removal can destroy the original");
+            failure.CancelPending();
+
+            var layered = new BackupService();
+            layered.BeginEdit(avatar, "outfit");
+            var later = Child(go, "LaterOutfit");
+            layered.NoteCreated(avatar, later);
+            Finish(layered, "Add later outfit");
+            var beforeCreation = layered.List(avatar).First();
+            layered.EndSession();
+            layered.BeginEdit(avatar, "outfit");
+            PrefabUtility.SaveForTests = (source, path) =>
+            {
+                var prefab = CopyHierarchy(source);
+                assets.Add(path, prefab);
+                return prefab;
+            };
+            layered.NoteRemoved(avatar, later);
+            Undo.DestroyObjectImmediate(later);
+            Finish(layered, "Remove later outfit");
+            new BackupService().Restore(avatar, beforeCreation);
+            Check(go.transform.Find("LaterOutfit") == null,
+                "Restoring across creation and later deletion reverses each snapshot in order");
+        }
+        finally
+        {
+            PrefabUtility.SaveForTests = save;
+            PrefabUtility.InstantiateForTests = instantiate;
+            PrefabUtility.UnpackForTests = unpack;
+            PrefabUtility.RootForTests = prefabRoot;
+            AssetDatabase.CreateForTests = create;
+            AssetDatabase.LoadForTests = load;
+            AssetDatabase.FindForTests = find;
+            AssetDatabase.PathForTests = pathFor;
+            AssetDatabase.DeleteForTests = delete;
+            Undo.CreatedForTests = created;
+            JsonUtility.DeserializeForTests = deserialize;
+            BackupService.InvalidateCache();
+        }
+    }
+
     public static void Main()
     {
         VisualElement.StyleForTests = () => new Style();
@@ -134,7 +497,10 @@ internal static class HistoryTests
         Undo.RecordForTests = target => Recorded.Add(target);
         EditorApplication.timeSinceStartup = 3600;
         GlobalObjectId.IdForTests = o => "GlobalObjectId_V1-2-0123456789abcdef0123456789abcdef-" + o.name + "-0";
-        // JSON を扱う参加機能の挙動は本物の Unity で確認する。このテストでは履歴自身に絞る。
+        var participants = (IList)typeof(BackupService).GetField("Participants", Static).GetValue(null);
+        Check(participants.Cast<IBackupParticipant>().Any(p => p is SkinShapeBackup) &&
+            participants.Cast<IBackupParticipant>().Any(p => p is WalkAnimatorBackup), "Skin and walk participants are registered");
+        // 履歴自身のテストでは参加機能を外し、末尾で各参加機能の復元を別に確認する。
         ((IList)typeof(BackupService).GetField("Participants", Static).GetValue(null)).Clear();
         var go = new GameObject { name = "テスト用アバター" };
         var root = new Transform { gameObject = go, name = "Root", localScale = new Vector3(1, 1, 1) };
@@ -409,6 +775,8 @@ internal static class HistoryTests
         Call(body, "OnPointerDown", ctx, new PointerDownEvent());
         Check((int)typeof(BodyFeature).GetField("_selected", Static).GetValue(null) == 1 && repaints == 3 && rebuilds == 0 && Recorded.Count == 0,
             "Selecting a silhouette point repaints locally without editing or rebuilding");
+        ParticipantRestoreChecks();
+        RemovedObjectChecks();
         Console.WriteLine("History and body checks passed (" + _checks + "). Native Undo, Prefab saving and rendering require Unity.");
     }
 }

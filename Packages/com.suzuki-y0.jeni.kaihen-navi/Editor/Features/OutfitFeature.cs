@@ -226,6 +226,7 @@ namespace Jeni.KaihenNavi
                 Undo.IncrementCurrentGroup();
                 var group = Undo.GetCurrentGroup();
                 Undo.SetCurrentGroupName(undoName);
+                ctx.NoteRemoved(outfit);
                 Undo.DestroyObjectImmediate(outfit);
                 ctx.CompleteEdit(group);
                 ctx.Tell(L10n.Tr("outfit.removed"));

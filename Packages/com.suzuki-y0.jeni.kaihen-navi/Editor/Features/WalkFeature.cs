@@ -422,6 +422,7 @@ namespace Jeni.KaihenNavi
 
                 var target = GimmickRoot(r.gameObject, avatar.gameObject);
                 if (target == avatar.gameObject) continue;
+                ctx.NoteRemoved(target);
                 Undo.DestroyObjectImmediate(target);
             }
 

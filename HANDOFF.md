@@ -2,14 +2,20 @@
 
 次の作業者（人でも AI でも）が、これだけ読めば続きから始められるようにまとめたもの。
 
-## 0. 最新の状況（2026-11-14 更新・Claude Code へ引き継ぎ）
+## 0. 最新の状況（2026-11-25 更新）
 
 **最初に読むところ。** 下の 1 章以降は経緯の記録で、古い記述（「Unity 実機は未確認」など）を含む。食い違ったらこの 0 章が正しい。
+
+### 今回の監査修正（2026-11-25・devin/1764038000-backup-restore-gaps・Unity 未確認）
+- 永続履歴から、削除した服・歩き方・明るさメニューを保存 Prefab から元の親・兄弟位置へ戻す。元アセットは変更せず、保存コピーは履歴と一緒に遅延整理する。
+- 既存の脱ぎ着メニューの既定値など、肌隠しの ShapeChanger（RemoveShape を含む）、歩き方の Merge Animator のコントローラー参照と設定も戻す。
+- `bash tools/check.sh`：History/body 96、InnerColor 327＋139、Feature edits 60、KonoAsset 84、4 言語 593 キー。MA の versionDefines と条件コンパイル範囲の静的検査（Editor C# 50 ファイル）・検査自体の回帰テスト 83 件も追加。NoMA は C# 分岐だけの確認で、Unity の asmdef 解決は検証しない。
+- **Unity で残る確認**：再起動後の永続履歴による削除物・既存設定の復元、JSON の旧データ互換、Prefab の保存・接続先（バックアップでなく元 Prefab）・親と兄弟順、Ctrl+Z/Redo、自動保存と起動時の整理。MA あり／なしの Unity 2022.3 でのインポート・コンパイル、MA プレビュー・Play/ビルドも未確認。下の 2026-11-15 の実機確認は以前の版の記録であり、今回の修正を検証したものではない。
 
 ### 0.0 2026-11-14〜15：洗い出しと一括修正（work/1114 → 2026-11-15 に main へマージ済み・主要部分は Unity 実機で確認済み）
 **いまの作業の正は main（8c1dead 以降）。** test/integration-1103（11-03 の統合）に、コードレビューと Unity 実機確認で見つけた問題の修正を重ねて main へマージした。
 - 進め方：Opus（推論・中）4 体でコード全体をレビュー → 33 件。Haiku（簡単な修正）2 班・Opus 3 班に、ファイルが重ならないよう分けて直し、統合後に別の Opus が差分全体をレビュー → 追加 6 件も修正。Fable は使っていない（そこまで難しい問題が無かった）。
-- `bash tools/check.sh` は通る（History 53、InnerColor 327＋139、Feature edits 52、KonoAsset 84 など）。**Unity の実機ではまだ一度も動かしていない。**
+- 過去の状況（2026-11-14 の一括修正直後）：スタブ検査は通ったが、この修正分は Unity 実機では未確認だった。**2026-11-15 の実機確認結果は下記が正**。現在のスタブ検査件数はこの章冒頭を参照。
 
 主な修正（重い順）
 - 元に戻す（フッター）：Unity の Undo の一覧の指紋（内部 API `Undo.GetRecords` をリフレクションで）とアバター ID が、最後の手順と一致するときだけ Unity の Undo を使う。違えばバックアップから戻す（別アバターやカメラ移動を取り消していた）。
@@ -26,7 +32,7 @@
 - 服の検索：ー・ん（m）・を（wo）・うぃ/うぇ のローマ字、かな 1 文字では使わない、語ごとのキャッシュ。KonoAsset に読めないファイルがあっても 5 秒ごとに作り直さない。プロジェクトに Prefab が増えたら一覧を更新（ツール自身の保存では更新しない）。
 - その他：フォントを再読み込み前に解放。部位の推定を単語単位に（Hair_Brown が「その他」にならない）。
 
-**Unity で最初に見ること（work/1114 を MCP Project に入れて）**
+**当時の確認予定（2026-11-14・work/1114 を MCP Project に入れて。実施結果は下記 2026-11-15）**
 1. コンパイル（`Undo.GetRecords`・`localBounds`・`GetNearestPrefabInstanceRoot` などスタブに足した API）。
 2. 色を変える → すぐフッターの 元に戻す：Unity の Undo で 1 手戻るか（指紋が合わずバックアップ復元になっていないか）。カメラを動かしてから押すとバックアップ復元になるか。
 3. インナーカラー → 元に戻す：.mat が残るか、残ればコンソールの参照元のログ。
@@ -124,6 +130,7 @@
 
 ### 0.6 Unity なしの確認
 - `bash tools/check.sh`（Mono の mcs が必要）：NoMA / WithMA / Full のコンパイル、4 言語のキーの一致、各種テスト。
+- MA 静的検査は versionDefines、MA 名前空間、スタブに宣言した MA 型と別名の使用範囲を検査する。コメント・通常の文字列（リフレクション用の型名など）は除外し、補間文字列は保守的に全体を検査する。NoMA は C# 分岐だけの確認で、Unity のアセンブリ解決の代わりにはならない。
 - Windows では `bash tools/check-win.sh`（Git Bash）。Mono を入れずに Unity 2022.3 同梱の Mono を使い、本物の Python を探して check.sh を動かす。シンボリックリンクの権限が無いときはジャンクションで代わりに試す。
 - `bash tools/test_inner_color.sh`：インナーカラーの面判定とファイル処理のテスト。
 - スタブ（tools/stubs）は Unity の Undo 本体・Prefab・描画を再現しない。最後は必ず Unity で確かめる。
@@ -469,6 +476,7 @@ Assets/KaihenNavi/
 
 ## 5. 設計の要点
 
+- **任意依存（README の動作環境と同じ）**：MA は任意・1.10.0 以降。asmdef の名前参照＋versionDefines の `KAIHENNAVI_MA`＋`#if` で有無を切り替え、VPM の必須依存には加えない。[Unity 2022.3 公式文書](https://docs.unity3d.com/2022.3/Documentation/Manual/upm-semver.html) は 2019.1 以降の欠落参照を optional reference 用に許容すると明記。[Unity スタッフの説明](https://discussions.unity.com/t/referencing-optional-assembly-definitions-in-a-package/852096) もこの組み合わせを推奨（欠落時は警告の可能性あり、コードを `#if` で除外すればコンパイルエラーにはしない）。MA なしの Unity 実機導入確認は別途必要。
 - **元アセットは絶対に書き換えない**: マテリアルは初回変更時に `Assets/KaihenNavi/<アバター名>/Materials/` へ複製し、アバター内の参照をすべて差し替える（`MaterialCopier`）
 - **自動バックアップ**: 「やりたいこと」を選んで最初に何か変える直前に 1 件保存（`BackupService.BeginEdit`）。同じ機能を続けて触っている間は追加しない。保存先は `Assets/KaihenNavi/<アバター名>/Backups/*.asset`、最大 20 件
   - 保存内容: 全 Transform（位置・回転・大きさ・表示）、全レンダラーのマテリアル参照、ツールの複製マテリアルの中身（サブアセットに複製）、BlendShape、View Position、脱ぎ着メニューの定義（`IBackupParticipant` で JSON）

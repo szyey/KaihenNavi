@@ -117,8 +117,13 @@ namespace UnityEngine
             parent = p;
             if (p != null) { p._children.Add(this); p.childCount = p._children.Count; }
         }
-        public int GetSiblingIndex() { return 0; }
-        public void SetSiblingIndex(int i) { }
+        public int GetSiblingIndex() { return parent == null ? 0 : parent._children.IndexOf(this); }
+        public void SetSiblingIndex(int i)
+        {
+            if (parent == null) return;
+            parent._children.Remove(this);
+            parent._children.Insert(Math.Max(0, Math.Min(i, parent._children.Count)), this);
+        }
         public void SetAsLastSibling() { }
         public Vector3 TransformDirection(Vector3 v) { return v; }
         public Vector3 TransformPoint(Vector3 v) { return v; }
@@ -918,15 +923,19 @@ namespace UnityEditor
         public static void ApplyPrefabInstance(GameObject g, InteractionMode m) { if (ApplyForTests != null) ApplyForTests(g, m); }
         public static Func<Object, Object> SourceForTests;
         public static T GetCorrespondingObjectFromSource<T>(T o) where T : Object { return SourceForTests == null ? null : SourceForTests(o) as T; }
-        public static Object InstantiatePrefab(Object o) { return null; }
+        public static Func<Object, Object> InstantiateForTests;
+        public static Object InstantiatePrefab(Object o) { return InstantiateForTests == null ? null : InstantiateForTests(o); }
         public static Object InstantiatePrefab(Object o, Transform parent) { return null; }
         public static void RevertObjectOverride(Object o, InteractionMode m) { }
         public static GameObject LoadPrefabContents(string path) { return null; }
         public static void UnloadPrefabContents(GameObject g) { }
-        public static GameObject SaveAsPrefabAsset(GameObject g, string path) { return g; }
+        public static Func<GameObject, string, GameObject> SaveForTests;
+        public static GameObject SaveAsPrefabAsset(GameObject g, string path) { return SaveForTests == null ? g : SaveForTests(g, path); }
         public static T GetCorrespondingObjectFromOriginalSource<T>(T o) where T : Object { return null; }
         public static void ReplacePrefabAssetOfPrefabInstance(GameObject root, GameObject asset, PrefabReplacingSettings s, InteractionMode m) { }
-        public static void UnpackPrefabInstance(GameObject root, PrefabUnpackMode mode, InteractionMode m) { }
+        public static Action<GameObject, PrefabUnpackMode, InteractionMode> UnpackForTests;
+        public static void UnpackPrefabInstance(GameObject root, PrefabUnpackMode mode, InteractionMode m)
+        { if (UnpackForTests != null) UnpackForTests(root, mode, m); }
         public static Object GetPrefabInstanceHandle(Object instanceComponentOrGameObject) { return null; }
         public static PropertyModification[] ModificationsForTests;
         public static PropertyModification[] GetPropertyModifications(Object targetPrefab) { return ModificationsForTests; }
@@ -1008,7 +1017,8 @@ namespace UnityEditor
             var go = o as GameObject;
             if (go != null) go.transform.SetParent(null, true);
         }
-        public static void RegisterCreatedObjectUndo(Object o, string n) { }
+        public static Action<Object> CreatedForTests;
+        public static void RegisterCreatedObjectUndo(Object o, string n) { if (CreatedForTests != null) CreatedForTests(o); }
         public static T AddComponent<T>(GameObject go) where T : Component { return go.AddComponent<T>(); }
         public static Component AddComponent(GameObject go, Type type) { return go.AddComponent(type); }
     }
